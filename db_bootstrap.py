@@ -38,7 +38,7 @@ class SchemaVersionTooNewError(RuntimeError):
 # numeric bump. This keeps a disabled install at schema_version 5 with no
 # embedding tables, fully openable by a base build, and leaves the numeric
 # counter free for the temporal train so neither collides on a v6.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -3097,6 +3097,141 @@ def ensure_external_content_fts(
     repair_external_content_fts(conn, spec, now=now, throttle=True)
 
 
+# ---------------------------------------------------------------------------
+# v6: message identity constraint (duplicate-proof storage)
+# ---------------------------------------------------------------------------
+# Root cause of the duplicate-row problem (issue #599): ``messages`` has no
+# identity constraint, so any replay/resume path that re-ingests an already
+# stored message creates a byte-identical duplicate row with a fresh
+# store_id. Replay-cursor guards (reconcile.py) mitigate the dominant shapes
+# but are coordination, not storage, and a store-only row can break the
+# suffix-exact proof, letting the fresh tail be re-appended per rebind
+# (issue #631).
+#
+# The identity key is validated on production data (2026-10-18, 42k rows):
+#   (session_id, role, observed_at, COALESCE(tool_call_id, ''), COALESCE(content, ''))
+#   - 0 false-positive groups (no group heterogeneous on source /
+#     conversation_id / tool_name), 0 groups with NULL content, 0 groups
+#     mixing NULL and '' tool_call_id.
+#   - COALESCE is REQUIRED for the unique index: SQLite treats NULLs as
+#     distinct in a unique index (a raw 5-tuple index would let every
+#     NULL-tool_call_id duplicate through), while GROUP BY treats NULLs as
+#     equal. COALESCE makes the index semantics match the grouping.
+#
+# The migration is self-contained and idempotent:
+#   1. remap references (summary_nodes.source_ids, lifecycle frontiers) to
+#      the canonical row (MIN store_id per identity group)
+#   2. delete the redundant rows (FTS triggers keep messages_fts in sync)
+#   3. create the unique identity index so future re-ingests are rejected at
+#      the storage layer
+# Re-running on an already-clean DB is a no-op (step 1-2 find nothing, step 3
+# uses IF NOT EXISTS).
+
+MESSAGE_IDENTITY_EXPR = (
+    "session_id, role, observed_at, "
+    "COALESCE(tool_call_id, ''), COALESCE(content, '')"
+)
+
+
+def _messages_table_exists(conn: sqlite3.Connection) -> bool:
+    """The v6 identity constraint is meaningless without the messages table.
+
+    ``run_versioned_migrations`` is also exercised on bare databases that only
+    carry the metadata/migration tables (see the rollup-store tests, which call
+    it without ``MessageStore._init_db`` having created ``messages`` first).
+    Match the v5 guard: skip the constraint when the table is absent rather
+    than failing.
+    """
+    return conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone() is not None
+
+
+def _dedup_redundant_messages(conn: sqlite3.Connection) -> dict:
+    """Remove duplicate message rows and remap their references.
+
+    Canonical row per identity group = MIN(store_id) (earliest durable copy).
+    Returns {"redundant": n, "nodes": n, "frontiers": n}. Idempotent.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT store_id, MIN(store_id) OVER (PARTITION BY {MESSAGE_IDENTITY_EXPR}) AS keep_id
+        FROM messages
+        """
+    ).fetchall()
+    redundant = {sid: keep for sid, keep in rows if sid != keep}
+    if not redundant:
+        return {"redundant": 0, "nodes": 0, "frontiers": 0}
+
+    # Remap summary_nodes.source_ids (JSON arrays of store_ids) to canonical
+    # rows, preserving order and de-duplicating (a node may reference both a
+    # canonical and a redundant row of the same group).
+    node_updates = []
+    for node_id, source_ids in conn.execute(
+        "SELECT node_id, source_ids FROM summary_nodes"
+    ):
+        try:
+            ids = json.loads(source_ids)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(ids, list):
+            continue
+        new = list(dict.fromkeys(redundant.get(x, x) for x in ids))
+        if new != ids:
+            node_updates.append((json.dumps(new), node_id))
+    for params in node_updates:
+        conn.execute(
+            "UPDATE summary_nodes SET source_ids=? WHERE node_id=?", params
+        )
+
+    # Remap lifecycle frontiers to canonical rows.
+    life_updates = []
+    for conv, cur_f, last_f in conn.execute(
+        "SELECT conversation_id, current_frontier_store_id, "
+        "last_finalized_frontier_store_id FROM lcm_lifecycle_state"
+    ):
+        nc = redundant.get(cur_f, cur_f) if cur_f else cur_f
+        nl = redundant.get(last_f, last_f) if last_f else last_f
+        if nc != cur_f or nl != last_f:
+            life_updates.append((nc, nl, conv))
+    for params in life_updates:
+        conn.execute(
+            "UPDATE lcm_lifecycle_state SET current_frontier_store_id=?, "
+            "last_finalized_frontier_store_id=? WHERE conversation_id=?",
+            params,
+        )
+
+    # Delete redundant rows in chunks (messages_fts triggers stay in sync).
+    ids = list(redundant)
+    for i in range(0, len(ids), 500):
+        chunk = ids[i : i + 500]
+        conn.execute(
+            f"DELETE FROM messages WHERE store_id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        )
+
+    return {
+        "redundant": len(ids),
+        "nodes": len(node_updates),
+        "frontiers": len(life_updates),
+    }
+
+
+def ensure_message_identity_constraint(conn: sqlite3.Connection) -> None:
+    """Create the unique message identity index (v6).
+
+    The index only succeeds once no duplicate identity rows remain, so the
+    dedup pre-pass (``_dedup_redundant_messages``) must run first. ``IF NOT
+    EXISTS`` keeps the step idempotent on already-migrated databases.
+    """
+    conn.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_identity
+        ON messages ({MESSAGE_IDENTITY_EXPR})
+        """
+    )
+
+
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     refuse_schema_version_too_new(conn)
 
@@ -3125,6 +3260,24 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 5:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
+
+    if current_version < 6:
+        # v6: message identity constraint. Self-contained and idempotent:
+        # dedup (remap refs + delete redundant rows) then create the unique
+        # index. The index creation is the gate — it fails loudly if any
+        # duplicate identity rows survived the pre-pass, which cannot happen
+        # on a single-writer connection but would surface a data bug loudly
+        # rather than silently keeping the DB un-constrained.
+        if _messages_table_exists(conn):
+            _dedup_redundant_messages(conn)
+            ensure_message_identity_constraint(conn)
+        mark_migration_step_complete(conn, "v6_message_identity_constraint")
+        current_version = 6
+    else:
+        # Already migrated (or a fresh DB bootstrapped at v6): make sure the
+        # index exists even on databases created before this code shipped.
+        if _messages_table_exists(conn):
+            ensure_message_identity_constraint(conn)
 
     # NOTE: the opt-in temporal-rollup tables are deliberately NOT created here.
     # Creating them would advance the core schema for every install (even with
