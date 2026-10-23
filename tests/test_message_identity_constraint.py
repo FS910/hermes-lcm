@@ -248,3 +248,168 @@ def test_fresh_db_bootstraps_at_v6_with_index(tmp_path):
     ).fetchone()[0]
     assert version == "6"
     store.close()
+
+
+def _append_tool(store, *, session_id="s1", content="ok", timestamp=1000.0,
+                 tool_call_id="tc-1") -> int:
+    return store.append(
+        session_id,
+        {
+            "role": "tool",
+            "content": content,
+            "timestamp": timestamp,
+            "tool_call_id": tool_call_id,
+        },
+        source="test",
+    )
+
+
+def test_tool_call_id_unique_index_created_on_fresh_db(tmp_path):
+    store = _store(tmp_path)
+    idx = store._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_msg_tool_call_id'"
+    ).fetchone()
+    assert idx is not None
+    assert "UNIQUE" in idx[0]
+    # Partial: must carry a WHERE clause on tool_call_id
+    assert "WHERE" in idx[0] and "tool_call_id" in idx[0]
+    # step recorded
+    step = store._conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name='tool_call_id_unique_v1'"
+    ).fetchone()
+    assert step is not None
+    # numeric schema_version unchanged (base-build compatible)
+    version = store._conn.execute(
+        "SELECT value FROM metadata WHERE key='schema_version'"
+    ).fetchone()[0]
+    assert version == "6"
+    store.close()
+
+
+def test_tool_reingest_different_observed_at_returns_existing_store_id(tmp_path):
+    """Same tool_call_id re-ingested with a DIFFERENT timestamp must collapse
+    to the existing row (the re-ingestion gap the v6 identity index misses)."""
+    store = _store(tmp_path)
+    first = _append_tool(store, content="ok", timestamp=1000.0, tool_call_id="tc-1")
+    # Same tool_call_id, different observed_at (replay / re-bind)
+    second = _append_tool(store, content="ok", timestamp=1039.0, tool_call_id="tc-1")
+    assert second == first
+    n = store._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='s1'"
+    ).fetchone()[0]
+    assert n == 1
+    store.close()
+
+
+def test_parallel_tool_calls_same_content_distinct_tool_call_id_preserved(tmp_path):
+    """Parallel calls that return identical content but have DIFFERENT
+    tool_call_ids are distinct messages and must NOT be merged."""
+    store = _store(tmp_path)
+    a = _append_tool(store, content="ok", timestamp=1000.0, tool_call_id="tc-a")
+    b = _append_tool(store, content="ok", timestamp=1000.0, tool_call_id="tc-b")
+    assert a != b
+    n = store._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='s1'"
+    ).fetchone()[0]
+    assert n == 2
+    store.close()
+
+
+def test_distinct_content_different_tool_call_id_preserved(tmp_path):
+    store = _store(tmp_path)
+    a = _append_tool(store, content="one", timestamp=1000.0, tool_call_id="tc-a")
+    b = _append_tool(store, content="two", timestamp=1000.0, tool_call_id="tb")
+    assert a != b
+    store.close()
+
+
+def test_migration_dedups_existing_tool_call_id_reingests(tmp_path):
+    """Simulate a legacy DB that has two rows sharing a tool_call_id (different
+    observed_at), plus a summary node + frontier referencing the redundant row.
+    The named migration must collapse to the canonical row and remap refs."""
+    store = _store(tmp_path)
+    con = store._conn
+    # Simulate a legacy pre-migration DB: drop the new index and clear the
+    # step marker so the duplicate rows can be seeded (mirrors the v6 test).
+    con.execute("DROP INDEX IF EXISTS idx_msg_tool_call_id")
+    con.execute("DELETE FROM lcm_migration_state WHERE step_name='tool_call_id_unique_v1'")
+    con.commit()
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS summary_nodes(
+            node_id INTEGER, session_id TEXT, depth INTEGER, summary TEXT,
+            token_count INTEGER, source_token_count INTEGER,
+            source_ids TEXT, source_type TEXT, created_at REAL,
+            earliest_at REAL, latest_at REAL, expand_hint TEXT
+        )"""
+    )
+    base = {
+        "session_id": "tci-s", "source": "test", "conversation_id": "tci-s",
+        "role": "tool", "content": "tool result", "tool_call_id": "tc-x",
+        "tool_calls": None, "tool_name": "x", "token_estimate": 0,
+        "pinned": 0, "observed_at": 1000.0,
+        "observed_at_source": "host_message_timestamp",
+    }
+    con.execute(
+        """INSERT INTO messages
+           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+            tool_name, timestamp, token_estimate, pinned, ingested_at,
+            observed_at, observed_at_source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (base["session_id"], base["source"], base["conversation_id"], base["role"],
+         base["content"], base["tool_call_id"], base["tool_calls"], base["tool_name"],
+         1000.0, 0, 0, 1000.0, 1000.0, base["observed_at_source"]),
+    )
+    keep_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    # re-ingest of the SAME tool_call_id, different observed_at
+    con.execute(
+        """INSERT INTO messages
+           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+            tool_name, timestamp, token_estimate, pinned, ingested_at,
+            observed_at, observed_at_source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (base["session_id"], base["source"], base["conversation_id"], base["role"],
+         base["content"], base["tool_call_id"], base["tool_calls"], base["tool_name"],
+         1039.0, 0, 0, 1039.0, 1039.0, base["observed_at_source"]),
+    )
+    dup_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    con.execute(
+        "INSERT INTO summary_nodes (node_id, session_id, depth, summary, source_ids, "
+        "source_type, created_at) VALUES (1, 'tci-s', 0, 's', ?, 'messages', 0.0)",
+        (json.dumps([keep_id, dup_id]),),
+    )
+    con.execute(
+        "INSERT INTO lcm_lifecycle_state (conversation_id, current_session_id, "
+        "current_frontier_store_id, last_finalized_frontier_store_id, updated_at) "
+        "VALUES ('tci-s', 'tci-s', ?, 0, 0.0)",
+        (dup_id,),
+    )
+    con.commit()
+
+    # Run the named migration (idempotent) — as construction does.
+    from hermes_lcm.db_bootstrap import ensure_tool_call_id_unique_constraint
+    ensure_tool_call_id_unique_constraint(con)
+
+    assert con.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='tci-s'"
+    ).fetchone()[0] == 1
+    assert con.execute(
+        "SELECT store_id FROM messages WHERE session_id='tci-s'"
+    ).fetchone()[0] == keep_id
+    node = json.loads(con.execute(
+        "SELECT source_ids FROM summary_nodes WHERE node_id=1"
+    ).fetchone()[0])
+    assert node == [keep_id]
+    fr = con.execute(
+        "SELECT current_frontier_store_id FROM lcm_lifecycle_state WHERE conversation_id='tci-s'"
+    ).fetchone()[0]
+    assert fr == keep_id
+    # unique index present
+    assert con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_msg_tool_call_id'"
+    ).fetchone() is not None
+    # idempotent: a second run is a no-op
+    ensure_tool_call_id_unique_constraint(con)
+    assert con.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='tci-s'"
+    ).fetchone()[0] == 1
+    store.close()

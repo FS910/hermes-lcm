@@ -2287,6 +2287,19 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(findings))
 
 
+def migration_step_present(conn: sqlite3.Connection, step_name: str) -> bool:
+    """True if a named migration step has already been recorded.
+
+    Read-only (no marker write) so it is safe to probe from construction
+    paths that must not contend with real writers.
+    """
+    ensure_migration_state_table(conn)
+    row = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name=?", (step_name,)
+    ).fetchone()
+    return row is not None
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
@@ -3147,19 +3160,14 @@ def _messages_table_exists(conn: sqlite3.Connection) -> bool:
     ).fetchone() is not None
 
 
-def _dedup_redundant_messages(conn: sqlite3.Connection) -> dict:
-    """Remove duplicate message rows and remap their references.
+def _remap_references_and_delete(conn: sqlite3.Connection, redundant: dict) -> dict:
+    """Remap summary-node sources and lifecycle frontiers to canonical rows,
+    then delete the redundant rows.
 
-    Canonical row per identity group = MIN(store_id) (earliest durable copy).
-    Returns {"redundant": n, "nodes": n, "frontiers": n}. Idempotent.
+    ``redundant`` maps redundant store_id -> canonical store_id. Returns
+    ``{"redundant": n, "nodes": n, "frontiers": n}``. Idempotent and safe on an
+    empty mapping (no-op).
     """
-    rows = conn.execute(
-        f"""
-        SELECT store_id, MIN(store_id) OVER (PARTITION BY {MESSAGE_IDENTITY_EXPR}) AS keep_id
-        FROM messages
-        """
-    ).fetchall()
-    redundant = {sid: keep for sid, keep in rows if sid != keep}
     if not redundant:
         return {"redundant": 0, "nodes": 0, "frontiers": 0}
 
@@ -3215,6 +3223,96 @@ def _dedup_redundant_messages(conn: sqlite3.Connection) -> dict:
         "nodes": len(node_updates),
         "frontiers": len(life_updates),
     }
+
+
+def _dedup_redundant_messages(conn: sqlite3.Connection) -> dict:
+    """Remove duplicate message rows and remap their references.
+
+    Canonical row per identity group = MIN(store_id) (earliest durable copy).
+    Returns {"redundant": n, "nodes": n, "frontiers": n}. Idempotent.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT store_id, MIN(store_id) OVER (PARTITION BY {MESSAGE_IDENTITY_EXPR}) AS keep_id
+        FROM messages
+        """
+    ).fetchall()
+    redundant = {sid: keep for sid, keep in rows if sid != keep}
+    return _remap_references_and_delete(conn, redundant)
+
+
+# ---------------------------------------------------------------------------
+# tool_call_id re-ingestion guard (named feature step, base-build compatible)
+#
+# The v6 identity index includes ``observed_at`` so two messages with identical
+# content but different host timestamps are (correctly) kept as distinct rows.
+# That leaves one re-ingestion gap: the SAME tool_call_id re-ingested with a
+# slightly different ``observed_at`` (replay / re-bind). A tool_call_id is
+# never reused for different content, and only tool rows carry one, so a
+# partial unique index on (session_id, tool_call_id) for tool rows is lossless:
+# it collapses only true re-ingests and leaves parallel calls (distinct
+# tool_call_ids, same content) untouched.
+#
+# Implemented as a NAMED migration step (like ``embeddings_v1``) rather than
+# bumping the numeric SCHEMA_VERSION, so the index does not change the core
+# schema stamp and a base build can still read the DB.
+# ---------------------------------------------------------------------------
+TOOL_CALL_ID_UNIQUE_STEP = "tool_call_id_unique_v1"
+TOOL_CALL_ID_UNIQUE_INDEX = "idx_msg_tool_call_id"
+
+
+def _dedup_redundant_tool_call_id_rows(conn: sqlite3.Connection) -> dict:
+    """Collapse rows that repeat the same (session_id, tool_call_id).
+
+    Only tool rows carry a non-empty tool_call_id, and a tool_call_id is never
+    reused for different content, so MIN(store_id) per group is the canonical
+    copy and the rest are pure re-ingestion. Returns the remap/delete stats.
+    """
+    rows = conn.execute(
+        """
+        SELECT store_id, MIN(store_id) OVER (
+            PARTITION BY session_id, tool_call_id
+        ) AS keep_id
+        FROM messages
+        WHERE tool_call_id IS NOT NULL AND tool_call_id != ''
+        """
+    ).fetchall()
+    redundant = {sid: keep for sid, keep in rows if sid != keep}
+    return _remap_references_and_delete(conn, redundant)
+
+
+def ensure_tool_call_id_unique_index(conn: sqlite3.Connection) -> None:
+    """Create the partial unique index on (session_id, tool_call_id).
+
+    Runs after the re-ingestion dedup so it cannot fail on a pre-existing
+    duplicate. ``IF NOT EXISTS`` keeps the step idempotent.
+    """
+    conn.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS {TOOL_CALL_ID_UNIQUE_INDEX}
+        ON messages (session_id, tool_call_id)
+        WHERE tool_call_id IS NOT NULL AND tool_call_id != ''
+        """
+    )
+
+
+def ensure_tool_call_id_unique_constraint(conn: sqlite3.Connection) -> None:
+    """Idempotent named migration: dedup tool_call_id re-ingests + index.
+
+    No-op when the step is already recorded. Does NOT touch the numeric
+    ``schema_version``.
+    """
+    if not _messages_table_exists(conn):
+        return
+    if migration_step_present(conn, TOOL_CALL_ID_UNIQUE_STEP):
+        # Still ensure the index exists (e.g. a DB migrated by an older
+        # build before this code shipped).
+        ensure_tool_call_id_unique_index(conn)
+        return
+    _dedup_redundant_tool_call_id_rows(conn)
+    ensure_tool_call_id_unique_index(conn)
+    mark_migration_step_complete(conn, TOOL_CALL_ID_UNIQUE_STEP)
+    conn.commit()
 
 
 def ensure_message_identity_constraint(conn: sqlite3.Connection) -> None:
@@ -3278,6 +3376,11 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         # index exists even on databases created before this code shipped.
         if _messages_table_exists(conn):
             ensure_message_identity_constraint(conn)
+
+    # Named feature step (base-build compatible): collapse tool_call_id
+    # re-ingestion and guard it with a partial unique index. Runs on every
+    # construction; idempotent and a no-op once the step is stamped.
+    ensure_tool_call_id_unique_constraint(conn)
 
     # NOTE: the opt-in temporal-rollup tables are deliberately NOT created here.
     # Creating them would advance the core schema for every install (even with

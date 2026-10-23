@@ -510,6 +510,16 @@ class MessageStore:
                 "" if content is None else content,
             ),
         ).fetchone()
+        if row is None and tool_call_id:
+            # Partial tool_call_id index conflict: the same tool_call_id was
+            # re-ingested with a different observed_at, so the full-identity
+            # lookup above misses. Recover the canonical row by (session_id,
+            # tool_call_id) — the partial index guarantees at most one.
+            row = self._conn.execute(
+                "SELECT store_id FROM messages "
+                "WHERE session_id = ? AND tool_call_id = ?",
+                (session_id, tool_call_id),
+            ).fetchone()
         if row is None:
             # Should not happen while holding the write lock on a single-writer
             # connection. Fail loudly rather than returning a bogus id.
